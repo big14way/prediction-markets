@@ -495,3 +495,4 @@
         (ok position)
     )
 )
+(define-data-var market-metric-1 uint u1)
