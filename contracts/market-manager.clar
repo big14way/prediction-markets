@@ -496,3 +496,4 @@
     )
 )
 (define-data-var market-metric-1 uint u1)
+(define-data-var market-metric-2 uint u2)
