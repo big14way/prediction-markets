@@ -17,6 +17,7 @@
 (define-constant ERR_ORACLE_NOT_VERIFIED (err u16008))
 (define-constant ERR_MARKET_ACTIVE (err u16009))
 (define-constant ERR_NO_POSITION (err u16010))
+(define-constant ERR_EARLY_BIRD_PERIOD_OVER (err u16011))
 
 ;; Market status
 (define-constant STATUS_OPEN u0)
@@ -36,6 +37,9 @@
 (define-data-var total-volume uint u0)
 (define-data-var total-fees-collected uint u0)
 (define-data-var contract-principal principal tx-sender)
+(define-data-var early-bird-bonus-bps uint u1000)
+(define-data-var early-bird-duration uint u86400)
+(define-data-var total-early-bird-bonuses uint u0)
 
 ;; ========================================
 ;; Data Maps
@@ -74,6 +78,16 @@
 (define-map claims
     { market-id: uint, user: principal }
     bool
+)
+
+;; Track early bird participants
+(define-map early-bird-participants
+    { market-id: uint, user: principal }
+    {
+        bet-time: uint,
+        bet-amount: uint,
+        bonus-earned: uint
+    }
 )
 
 ;; Verified oracles
@@ -368,6 +382,21 @@
         ;; Update total volume
         (var-set total-volume (+ (var-get total-volume) amount))
 
+        ;; Check and reward early bird
+        (let ((is-early-bird (< (- stacks-block-time (get created-at market)) (var-get early-bird-duration))))
+            (if is-early-bird
+                (let ((bonus (/ (* amount (var-get early-bird-bonus-bps)) u10000)))
+                    (begin
+                        (map-set early-bird-participants { market-id: market-id, user: caller } {
+                            bet-time: stacks-block-time,
+                            bet-amount: amount,
+                            bonus-earned: bonus
+                        })
+                        (var-set total-early-bird-bonuses (+ (var-get total-early-bird-bonuses) bonus))
+                        (print { event: "early-bird-bonus", market-id: market-id, user: caller, bonus: bonus, timestamp: stacks-block-time })
+                        true))
+                true))
+
         ;; Print odds update
         (print (generate-odds-message market-id outcome-index))
 
@@ -495,8 +524,3 @@
         (ok position)
     )
 )
-(define-data-var market-metric-1 uint u1)
-(define-data-var market-metric-2 uint u2)
-(define-data-var market-metric-3 uint u3)
-(define-data-var market-metric-4 uint u4)
-(define-data-var market-metric-5 uint u5)
