@@ -21,6 +21,9 @@
 (define-constant ERR_INSURANCE_NOT_FOUND (err u16012))
 (define-constant ERR_INSURANCE_EXISTS (err u16013))
 (define-constant ERR_INVALID_INSURANCE (err u16014))
+(define-constant ERR_STAKE_NOT_FOUND (err u16015))
+(define-constant ERR_INSUFFICIENT_STAKE (err u16016))
+(define-constant ERR_STAKE_LOCKED (err u16017))
 
 ;; Market status
 (define-constant STATUS_OPEN u0)
@@ -118,6 +121,44 @@
         purchased-at: uint,
         claimed: bool
     }
+)
+
+;; ========================================
+;; Liquidity Mining Data Structures
+;; ========================================
+
+(define-data-var mining-rewards-per-bet uint u100) ;; Reward points per bet
+(define-data-var stake-lock-period uint u604800) ;; 7 days lock period
+(define-data-var total-staked uint u0)
+(define-data-var total-mining-rewards uint u0)
+
+;; User mining rewards (points earned from betting activity)
+(define-map mining-rewards
+    principal
+    {
+        total-earned: uint,
+        total-claimed: uint,
+        last-updated: uint
+    }
+)
+
+;; Staked winnings for additional rewards
+(define-map staked-winnings
+    { user: principal, stake-id: uint }
+    {
+        amount: uint,
+        staked-at: uint,
+        unlock-at: uint,
+        claimed: bool
+    }
+)
+
+(define-data-var stake-counter uint u0)
+
+;; Track user stakes
+(define-map user-stakes
+    principal
+    (list 20 uint)
 )
 
 ;; ========================================
@@ -292,6 +333,45 @@
         )
         false
     )
+)
+
+;; ========================================
+;; Liquidity Mining Read-Only Functions
+;; ========================================
+
+(define-read-only (get-mining-rewards (user principal))
+    (default-to
+        { total-earned: u0, total-claimed: u0, last-updated: u0 }
+        (map-get? mining-rewards user)
+    )
+)
+
+(define-read-only (get-stake (user principal) (stake-id uint))
+    (map-get? staked-winnings { user: user, stake-id: stake-id })
+)
+
+(define-read-only (get-user-stakes (user principal))
+    (default-to (list) (map-get? user-stakes user))
+)
+
+(define-read-only (is-stake-unlocked (user principal) (stake-id uint))
+    (match (get-stake user stake-id)
+        stake (>= stacks-block-time (get unlock-at stake))
+        false
+    )
+)
+
+(define-read-only (get-total-staked)
+    (var-get total-staked)
+)
+
+(define-read-only (get-mining-stats)
+    {
+        total-staked: (var-get total-staked),
+        total-mining-rewards: (var-get total-mining-rewards),
+        rewards-per-bet: (var-get mining-rewards-per-bet),
+        stake-lock-period: (var-get stake-lock-period)
+    }
 )
 
 ;; ========================================
@@ -668,7 +748,116 @@
             coverage-bps: coverage-bps,
             timestamp: stacks-block-time
         })
-        
+
+        (ok true)
+    )
+)
+
+;; ========================================
+;; Liquidity Mining Public Functions
+;; ========================================
+
+;; Stake winnings for additional rewards
+(define-public (stake-winnings (amount uint))
+    (let
+        (
+            (stake-id (var-get stake-counter))
+            (current-time stacks-block-time)
+            (unlock-time (+ current-time (var-get stake-lock-period)))
+            (user-stake-list (get-user-stakes tx-sender))
+        )
+        (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+
+        ;; Transfer STX to contract
+        (unwrap! (stx-transfer? amount tx-sender (var-get contract-principal)) ERR_INVALID_AMOUNT)
+
+        ;; Create stake record
+        (map-set staked-winnings
+            { user: tx-sender, stake-id: stake-id }
+            {
+                amount: amount,
+                staked-at: current-time,
+                unlock-at: unlock-time,
+                claimed: false
+            }
+        )
+
+        ;; Track user stakes
+        (map-set user-stakes
+            tx-sender
+            (unwrap! (as-max-len? (append user-stake-list stake-id) u20) ERR_INVALID_AMOUNT)
+        )
+
+        ;; Update totals
+        (var-set stake-counter (+ stake-id u1))
+        (var-set total-staked (+ (var-get total-staked) amount))
+
+        (print {
+            event: "winnings-staked",
+            user: tx-sender,
+            stake-id: stake-id,
+            amount: amount,
+            unlock-at: unlock-time,
+            timestamp: current-time
+        })
+
+        (ok stake-id)
+    )
+)
+
+;; Unstake after lock period with 10% bonus
+(define-public (unstake (stake-id uint))
+    (let
+        (
+            (stake (unwrap! (get-stake tx-sender stake-id) ERR_STAKE_NOT_FOUND))
+            (current-time stacks-block-time)
+            (bonus (/ (get amount stake) u10))
+        )
+        (asserts! (not (get claimed stake)) ERR_ALREADY_CLAIMED)
+        (asserts! (>= current-time (get unlock-at stake)) ERR_STAKE_LOCKED)
+
+        ;; Mark as claimed
+        (map-set staked-winnings
+            { user: tx-sender, stake-id: stake-id }
+            (merge stake { claimed: true })
+        )
+
+        ;; Transfer back with bonus
+        (unwrap! (stx-transfer? (+ (get amount stake) bonus) (var-get contract-principal) tx-sender) ERR_INVALID_AMOUNT)
+
+        ;; Update total staked
+        (var-set total-staked (- (var-get total-staked) (get amount stake)))
+
+        (print {
+            event: "winnings-unstaked",
+            user: tx-sender,
+            stake-id: stake-id,
+            amount: (get amount stake),
+            bonus: bonus,
+            timestamp: current-time
+        })
+
+        (ok true)
+    )
+)
+
+;; Admin: Update mining parameters
+(define-public (set-mining-params (rewards-per-bet uint) (lock-period uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+        (asserts! (> rewards-per-bet u0) ERR_INVALID_AMOUNT)
+        (asserts! (> lock-period u0) ERR_INVALID_AMOUNT)
+
+        (var-set mining-rewards-per-bet rewards-per-bet)
+        (var-set stake-lock-period lock-period)
+
+        (print {
+            event: "mining-params-updated",
+            rewards-per-bet: rewards-per-bet,
+            lock-period: lock-period,
+            timestamp: stacks-block-time
+        })
+
         (ok true)
     )
 )
