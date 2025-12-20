@@ -18,6 +18,9 @@
 (define-constant ERR_MARKET_ACTIVE (err u16009))
 (define-constant ERR_NO_POSITION (err u16010))
 (define-constant ERR_EARLY_BIRD_PERIOD_OVER (err u16011))
+(define-constant ERR_INSURANCE_NOT_FOUND (err u16012))
+(define-constant ERR_INSURANCE_EXISTS (err u16013))
+(define-constant ERR_INVALID_INSURANCE (err u16014))
 
 ;; Market status
 (define-constant STATUS_OPEN u0)
@@ -40,6 +43,9 @@
 (define-data-var early-bird-bonus-bps uint u1000)
 (define-data-var early-bird-duration uint u86400)
 (define-data-var total-early-bird-bonuses uint u0)
+(define-data-var insurance-pool-balance uint u0)
+(define-data-var insurance-premium-bps uint u500)
+(define-data-var insurance-coverage-bps uint u5000)
 
 ;; ========================================
 ;; Data Maps
@@ -99,6 +105,18 @@
         verified-at: uint,
         total-resolutions: uint,
         active: bool
+    }
+)
+
+;; Bet insurance policies
+(define-map bet-insurance
+    { market-id: uint, user: principal, outcome-index: uint }
+    {
+        insured-amount: uint,
+        premium-paid: uint,
+        coverage-amount: uint,
+        purchased-at: uint,
+        claimed: bool
     }
 )
 
@@ -197,6 +215,26 @@
     )
 )
 
+;; Get insurance policy
+(define-read-only (get-insurance (market-id uint) (user principal) (outcome-index uint))
+    (map-get? bet-insurance { market-id: market-id, user: user, outcome-index: outcome-index })
+)
+
+;; Check if user has insurance
+(define-read-only (has-insurance (market-id uint) (user principal) (outcome-index uint))
+    (is-some (get-insurance market-id user outcome-index))
+)
+
+;; Calculate insurance premium
+(define-read-only (calculate-insurance-premium (bet-amount uint))
+    (/ (* bet-amount (var-get insurance-premium-bps)) u10000)
+)
+
+;; Calculate insurance coverage
+(define-read-only (calculate-insurance-coverage (bet-amount uint))
+    (/ (* bet-amount (var-get insurance-coverage-bps)) u10000)
+)
+
 ;; Generate market info message using to-ascii?
 (define-read-only (generate-market-info (market-id uint))
     (match (map-get? markets market-id)
@@ -206,7 +244,7 @@
                 (pool-str (unwrap-panic (to-ascii? (get total-pool market))))
                 (status-str (unwrap-panic (to-ascii? (get status market))))
             )
-            (concat 
+            (concat
                 (concat (concat "Market #" id-str) ": ")
                 (concat (get question market)
                     (concat (concat " | Pool: " pool-str) (concat " | Status: " status-str))
@@ -522,5 +560,115 @@
         (try! (stx-transfer? position (var-get contract-principal) caller))
         
         (ok position)
+    )
+)
+
+;; ========================================
+;; Bet Insurance Functions
+;; ========================================
+
+;; Purchase insurance for a bet
+(define-public (purchase-insurance (market-id uint) (outcome-index uint) (bet-amount uint))
+    (let (
+        (market (unwrap! (map-get? markets market-id) ERR_MARKET_NOT_FOUND))
+        (position (get-position market-id tx-sender outcome-index))
+        (premium (calculate-insurance-premium bet-amount))
+        (coverage (calculate-insurance-coverage bet-amount))
+        (current-time stacks-block-time)
+        )
+        ;; Validations
+        (asserts! (is-eq (get status market) STATUS_OPEN) ERR_MARKET_CLOSED)
+        (asserts! (> bet-amount u0) ERR_INVALID_AMOUNT)
+        (asserts! (<= bet-amount position) ERR_INVALID_INSURANCE)
+        (asserts! (is-none (get-insurance market-id tx-sender outcome-index)) ERR_INSURANCE_EXISTS)
+
+        ;; Pay insurance premium
+        (try! (stx-transfer? premium tx-sender (var-get contract-principal)))
+
+        ;; Create insurance policy
+        (map-set bet-insurance
+            { market-id: market-id, user: tx-sender, outcome-index: outcome-index }
+            {
+                insured-amount: bet-amount,
+                premium-paid: premium,
+                coverage-amount: coverage,
+                purchased-at: current-time,
+                claimed: false
+            }
+        )
+
+        ;; Update insurance pool
+        (var-set insurance-pool-balance (+ (var-get insurance-pool-balance) premium))
+
+        (print {
+            event: "insurance-purchased",
+            market-id: market-id,
+            user: tx-sender,
+            outcome-index: outcome-index,
+            insured-amount: bet-amount,
+            premium: premium,
+            coverage: coverage,
+            timestamp: current-time
+        })
+
+        (ok { premium: premium, coverage: coverage })
+    )
+)
+
+;; Claim insurance payout (for losing bets)
+(define-public (claim-insurance-payout (market-id uint) (outcome-index uint))
+    (let (
+        (market (unwrap! (map-get? markets market-id) ERR_MARKET_NOT_FOUND))
+        (insurance (unwrap! (get-insurance market-id tx-sender outcome-index) ERR_INSURANCE_NOT_FOUND))
+        (winning-outcome (unwrap! (get winning-outcome market) ERR_MARKET_NOT_RESOLVED))
+        )
+        ;; Validations
+        (asserts! (is-eq (get status market) STATUS_RESOLVED) ERR_MARKET_NOT_RESOLVED)
+        (asserts! (not (get claimed insurance)) ERR_ALREADY_CLAIMED)
+        (asserts! (not (is-eq outcome-index winning-outcome)) ERR_INVALID_OUTCOME) ;; Can only claim if lost
+
+        ;; Mark as claimed
+        (map-set bet-insurance
+            { market-id: market-id, user: tx-sender, outcome-index: outcome-index }
+            (merge insurance { claimed: true })
+        )
+
+        ;; Pay coverage
+        (try! (stx-transfer? (get coverage-amount insurance) (var-get contract-principal) tx-sender))
+
+        ;; Update insurance pool
+        (var-set insurance-pool-balance (- (var-get insurance-pool-balance) (get coverage-amount insurance)))
+
+        (print {
+            event: "insurance-claimed",
+            market-id: market-id,
+            user: tx-sender,
+            outcome-index: outcome-index,
+            payout: (get coverage-amount insurance),
+            timestamp: stacks-block-time
+        })
+
+        (ok (get coverage-amount insurance))
+    )
+)
+
+;; Admin: Update insurance parameters
+(define-public (update-insurance-params (premium-bps uint) (coverage-bps uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+        (asserts! (<= premium-bps u1000) ERR_INVALID_INSURANCE) ;; Max 10% premium
+        (asserts! (<= coverage-bps u10000) ERR_INVALID_INSURANCE) ;; Max 100% coverage
+        
+        (var-set insurance-premium-bps premium-bps)
+        (var-set insurance-coverage-bps coverage-bps)
+        
+        (print {
+            event: "insurance-params-updated",
+            premium-bps: premium-bps,
+            coverage-bps: coverage-bps,
+            timestamp: stacks-block-time
+        })
+        
+        (ok true)
     )
 )
