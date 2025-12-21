@@ -27,6 +27,12 @@
 (define-constant ERR_LIQUIDITY_NOT_FOUND (err u16018))
 (define-constant ERR_INSUFFICIENT_LIQUIDITY (err u16019))
 (define-constant ERR_LIQUIDITY_LOCKED (err u16020))
+(define-constant ERR_DERIVATIVE_NOT_FOUND (err u16021))
+(define-constant ERR_DERIVATIVE_EXISTS (err u16022))
+(define-constant ERR_INVALID_STRIKE (err u16023))
+(define-constant ERR_DERIVATIVE_EXPIRED (err u16024))
+(define-constant ERR_INSUFFICIENT_COLLATERAL (err u16025))
+(define-constant ERR_POSITION_EXISTS (err u16026))
 
 ;; Market status
 (define-constant STATUS_OPEN u0)
@@ -185,6 +191,52 @@
         fees-earned: uint,
         provided-at: uint
     }
+)
+
+;; ========================================
+;; Market Derivatives System
+;; ========================================
+
+(define-data-var derivative-counter uint u0)
+
+;; Derivative types: call (bet on price going up), put (bet on price going down)
+(define-constant DERIVATIVE_CALL u0)
+(define-constant DERIVATIVE_PUT u1)
+
+;; Market derivatives (options contracts)
+(define-map market-derivatives
+    { derivative-id: uint }
+    {
+        market-id: uint,
+        derivative-type: uint,
+        strike-price: uint,  ;; Target price/odds
+        premium: uint,       ;; Cost to purchase
+        expiry-time: uint,
+        creator: principal,
+        collateral: uint,
+        total-supply: uint,
+        sold: uint,
+        active: bool,
+        settled: bool,
+        payout-per-contract: uint
+    }
+)
+
+;; User derivative positions
+(define-map derivative-positions
+    { user: principal, derivative-id: uint }
+    {
+        contracts: uint,
+        purchased-at: uint,
+        total-cost: uint,
+        exercised: bool
+    }
+)
+
+;; Track derivatives for each market
+(define-map market-derivative-list
+    { market-id: uint }
+    (list 50 uint)
 )
 
 ;; ========================================
@@ -398,6 +450,65 @@
         rewards-per-bet: (var-get mining-rewards-per-bet),
         stake-lock-period: (var-get stake-lock-period)
     }
+)
+
+;; ========================================
+;; Derivative Read-Only Functions
+;; ========================================
+
+(define-read-only (get-derivative (derivative-id uint))
+    (map-get? market-derivatives { derivative-id: derivative-id })
+)
+
+(define-read-only (get-derivative-position (user principal) (derivative-id uint))
+    (map-get? derivative-positions { user: user, derivative-id: derivative-id })
+)
+
+(define-read-only (get-market-derivatives (market-id uint))
+    (default-to (list) (map-get? market-derivative-list { market-id: market-id }))
+)
+
+(define-read-only (calculate-derivative-value (derivative-id uint) (current-odds uint))
+    (match (get-derivative derivative-id)
+        deriv (let
+            (
+                (strike (get strike-price deriv))
+                (deriv-type (get derivative-type deriv))
+            )
+            (if (is-eq deriv-type DERIVATIVE_CALL)
+                ;; Call option: value = max(current - strike, 0)
+                (if (> current-odds strike)
+                    (- current-odds strike)
+                    u0)
+                ;; Put option: value = max(strike - current, 0)
+                (if (> strike current-odds)
+                    (- strike current-odds)
+                    u0)))
+        u0)
+)
+
+(define-read-only (get-derivative-stats (derivative-id uint))
+    (match (get-derivative derivative-id)
+        deriv {
+            market-id: (get market-id deriv),
+            derivative-type: (get derivative-type deriv),
+            strike-price: (get strike-price deriv),
+            premium: (get premium deriv),
+            total-supply: (get total-supply deriv),
+            sold: (get sold deriv),
+            active: (get active deriv),
+            settled: (get settled deriv)
+        }
+        {
+            market-id: u0,
+            derivative-type: u0,
+            strike-price: u0,
+            premium: u0,
+            total-supply: u0,
+            sold: u0,
+            active: false,
+            settled: false
+        })
 )
 
 ;; ========================================
@@ -918,3 +1029,227 @@
               fees-collected: (get fees-collected liq) })
         (print { event: "liquidity-withdrawn", market-id: market-id, provider: tx-sender, amount: amount })
         (ok amount)))
+
+;; ========================================
+;; Market Derivatives Public Functions
+;; ========================================
+
+;; Create derivative contract for a market
+(define-public (create-derivative (market-id uint) (derivative-type uint) (strike-price uint) (premium uint) (total-supply uint) (expiry-duration uint) (collateral uint))
+    (let
+        (
+            (market (unwrap! (get-market market-id) ERR_MARKET_NOT_FOUND))
+            (derivative-id (+ (var-get derivative-counter) u1))
+            (current-time stacks-block-time)
+            (expiry-time (+ current-time expiry-duration))
+            (derivatives-list (get-market-derivatives market-id))
+        )
+        (asserts! (is-eq (get status market) STATUS_OPEN) ERR_MARKET_CLOSED)
+        (asserts! (or (is-eq derivative-type DERIVATIVE_CALL) (is-eq derivative-type DERIVATIVE_PUT)) ERR_INVALID_OUTCOME)
+        (asserts! (> strike-price u0) ERR_INVALID_STRIKE)
+        (asserts! (> premium u0) ERR_INVALID_AMOUNT)
+        (asserts! (> total-supply u0) ERR_INVALID_AMOUNT)
+        (asserts! (> collateral u0) ERR_INSUFFICIENT_COLLATERAL)
+        
+        ;; Transfer collateral to contract
+        (try! (stx-transfer? collateral tx-sender (var-get contract-principal)))
+        
+        ;; Create derivative
+        (map-set market-derivatives
+            { derivative-id: derivative-id }
+            {
+                market-id: market-id,
+                derivative-type: derivative-type,
+                strike-price: strike-price,
+                premium: premium,
+                expiry-time: expiry-time,
+                creator: tx-sender,
+                collateral: collateral,
+                total-supply: total-supply,
+                sold: u0,
+                active: true,
+                settled: false,
+                payout-per-contract: u0
+            }
+        )
+        
+        ;; Add to market derivative list
+        (map-set market-derivative-list
+            { market-id: market-id }
+            (unwrap! (as-max-len? (append derivatives-list derivative-id) u50) ERR_INVALID_AMOUNT)
+        )
+        
+        (var-set derivative-counter derivative-id)
+        
+        (print {
+            event: "derivative-created",
+            derivative-id: derivative-id,
+            market-id: market-id,
+            derivative-type: derivative-type,
+            strike-price: strike-price,
+            premium: premium,
+            total-supply: total-supply,
+            creator: tx-sender,
+            timestamp: current-time
+        })
+        
+        (ok derivative-id)
+    )
+)
+
+;; Purchase derivative contracts
+(define-public (purchase-derivative (derivative-id uint) (contracts uint))
+    (let
+        (
+            (deriv (unwrap! (get-derivative derivative-id) ERR_DERIVATIVE_NOT_FOUND))
+            (existing-position (get-derivative-position tx-sender derivative-id))
+            (cost (* contracts (get premium deriv)))
+            (new-sold (+ (get sold deriv) contracts))
+        )
+        (asserts! (get active deriv) ERR_DERIVATIVE_EXPIRED)
+        (asserts! (>= (get expiry-time deriv) stacks-block-time) ERR_DERIVATIVE_EXPIRED)
+        (asserts! (> contracts u0) ERR_INVALID_AMOUNT)
+        (asserts! (<= new-sold (get total-supply deriv)) ERR_INSUFFICIENT_LIQUIDITY)
+        
+        ;; Transfer payment to creator
+        (try! (stx-transfer? cost tx-sender (get creator deriv)))
+        
+        ;; Update or create position
+        (match existing-position
+            position (map-set derivative-positions
+                { user: tx-sender, derivative-id: derivative-id }
+                {
+                    contracts: (+ (get contracts position) contracts),
+                    purchased-at: (get purchased-at position),
+                    total-cost: (+ (get total-cost position) cost),
+                    exercised: false
+                })
+            (map-set derivative-positions
+                { user: tx-sender, derivative-id: derivative-id }
+                {
+                    contracts: contracts,
+                    purchased-at: stacks-block-time,
+                    total-cost: cost,
+                    exercised: false
+                }))
+        
+        ;; Update derivative
+        (map-set market-derivatives
+            { derivative-id: derivative-id }
+            (merge deriv { sold: new-sold })
+        )
+        
+        (print {
+            event: "derivative-purchased",
+            derivative-id: derivative-id,
+            buyer: tx-sender,
+            contracts: contracts,
+            cost: cost,
+            timestamp: stacks-block-time
+        })
+        
+        (ok true)
+    )
+)
+
+;; Settle derivative based on market outcome
+(define-public (settle-derivative (derivative-id uint) (final-odds uint))
+    (let
+        (
+            (deriv (unwrap! (get-derivative derivative-id) ERR_DERIVATIVE_NOT_FOUND))
+            (market (unwrap! (get-market (get market-id deriv)) ERR_MARKET_NOT_FOUND))
+            (intrinsic-value (calculate-derivative-value derivative-id final-odds))
+            (payout (if (> intrinsic-value u0) intrinsic-value u0))
+        )
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+        (asserts! (is-eq (get status market) STATUS_RESOLVED) ERR_MARKET_NOT_RESOLVED)
+        (asserts! (not (get settled deriv)) ERR_ALREADY_CLAIMED)
+        
+        ;; Mark as settled
+        (map-set market-derivatives
+            { derivative-id: derivative-id }
+            (merge deriv {
+                settled: true,
+                active: false,
+                payout-per-contract: payout
+            })
+        )
+        
+        (print {
+            event: "derivative-settled",
+            derivative-id: derivative-id,
+            final-odds: final-odds,
+            payout-per-contract: payout,
+            timestamp: stacks-block-time
+        })
+        
+        (ok payout)
+    )
+)
+
+;; Exercise/claim derivative payout
+(define-public (exercise-derivative (derivative-id uint))
+    (let
+        (
+            (deriv (unwrap! (get-derivative derivative-id) ERR_DERIVATIVE_NOT_FOUND))
+            (position (unwrap! (get-derivative-position tx-sender derivative-id) ERR_NO_POSITION))
+            (total-payout (* (get contracts position) (get payout-per-contract deriv)))
+        )
+        (asserts! (get settled deriv) ERR_MARKET_NOT_RESOLVED)
+        (asserts! (not (get exercised position)) ERR_ALREADY_CLAIMED)
+        (asserts! (> total-payout u0) ERR_INVALID_AMOUNT)
+        
+        ;; Transfer payout to user
+        (try! (stx-transfer? total-payout (var-get contract-principal) tx-sender))
+        
+        ;; Mark as exercised
+        (map-set derivative-positions
+            { user: tx-sender, derivative-id: derivative-id }
+            (merge position { exercised: true })
+        )
+        
+        (print {
+            event: "derivative-exercised",
+            derivative-id: derivative-id,
+            user: tx-sender,
+            contracts: (get contracts position),
+            payout: total-payout,
+            timestamp: stacks-block-time
+        })
+        
+        (ok total-payout)
+    )
+)
+
+;; Cancel derivative if not sold out (creator only)
+(define-public (cancel-derivative (derivative-id uint))
+    (let
+        (
+            (deriv (unwrap! (get-derivative derivative-id) ERR_DERIVATIVE_NOT_FOUND))
+            (refund (get collateral deriv))
+        )
+        (asserts! (is-eq tx-sender (get creator deriv)) ERR_NOT_AUTHORIZED)
+        (asserts! (get active deriv) ERR_DERIVATIVE_EXPIRED)
+        (asserts! (is-eq (get sold deriv) u0) ERR_POSITION_EXISTS)
+        
+        ;; Refund collateral to creator
+        (try! (stx-transfer? refund (var-get contract-principal) tx-sender))
+        
+        ;; Mark as inactive
+        (map-set market-derivatives
+            { derivative-id: derivative-id }
+            (merge deriv { active: false })
+        )
+        
+        (print {
+            event: "derivative-cancelled",
+            derivative-id: derivative-id,
+            creator: tx-sender,
+            refund: refund,
+            timestamp: stacks-block-time
+        })
+        
+        (ok refund)
+    )
+)
+
