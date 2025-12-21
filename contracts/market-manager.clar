@@ -24,6 +24,9 @@
 (define-constant ERR_STAKE_NOT_FOUND (err u16015))
 (define-constant ERR_INSUFFICIENT_STAKE (err u16016))
 (define-constant ERR_STAKE_LOCKED (err u16017))
+(define-constant ERR_LIQUIDITY_NOT_FOUND (err u16018))
+(define-constant ERR_INSUFFICIENT_LIQUIDITY (err u16019))
+(define-constant ERR_LIQUIDITY_LOCKED (err u16020))
 
 ;; Market status
 (define-constant STATUS_OPEN u0)
@@ -159,6 +162,29 @@
 (define-map user-stakes
     principal
     (list 20 uint)
+)
+
+;; Market Maker Liquidity System
+(define-data-var liquidity-counter uint u0)
+(define-data-var total-liquidity-provided uint u0)
+
+(define-map market-liquidity
+    { market-id: uint }
+    {
+        total-liquidity: uint,
+        total-shares: uint,
+        fees-collected: uint
+    }
+)
+
+(define-map liquidity-positions
+    { provider: principal, market-id: uint }
+    {
+        shares: uint,
+        amount-provided: uint,
+        fees-earned: uint,
+        provided-at: uint
+    }
 )
 
 ;; ========================================
@@ -861,3 +887,34 @@
         (ok true)
     )
 )
+
+;; Provide liquidity to market
+(define-public (provide-liquidity (market-id uint) (amount uint))
+    (let ((market (unwrap! (get-market market-id) ERR_MARKET_NOT_FOUND))
+          (liq (default-to { total-liquidity: u0, total-shares: u0, fees-collected: u0 }
+                           (map-get? market-liquidity { market-id: market-id })))
+          (shares (if (is-eq (get total-shares liq) u0) amount
+                      (/ (* amount (get total-shares liq)) (get total-liquidity liq)))))
+        (unwrap! (stx-transfer? amount tx-sender (var-get contract-principal)) ERR_INVALID_AMOUNT)
+        (map-set market-liquidity { market-id: market-id }
+            { total-liquidity: (+ (get total-liquidity liq) amount),
+              total-shares: (+ (get total-shares liq) shares),
+              fees-collected: (get fees-collected liq) })
+        (map-set liquidity-positions { provider: tx-sender, market-id: market-id }
+            { shares: shares, amount-provided: amount, fees-earned: u0, provided-at: stacks-block-time })
+        (print { event: "liquidity-provided", market-id: market-id, provider: tx-sender, amount: amount, shares: shares })
+        (ok shares)))
+
+;; Withdraw liquidity from market
+(define-public (withdraw-liquidity (market-id uint) (shares uint))
+    (let ((pos (unwrap! (map-get? liquidity-positions { provider: tx-sender, market-id: market-id }) ERR_LIQUIDITY_NOT_FOUND))
+          (liq (unwrap! (map-get? market-liquidity { market-id: market-id }) ERR_LIQUIDITY_NOT_FOUND))
+          (amount (/ (* shares (get total-liquidity liq)) (get total-shares liq))))
+        (asserts! (>= (get shares pos) shares) ERR_INSUFFICIENT_LIQUIDITY)
+        (unwrap! (stx-transfer? amount (var-get contract-principal) tx-sender) ERR_INSUFFICIENT_LIQUIDITY)
+        (map-set market-liquidity { market-id: market-id }
+            { total-liquidity: (- (get total-liquidity liq) amount),
+              total-shares: (- (get total-shares liq) shares),
+              fees-collected: (get fees-collected liq) })
+        (print { event: "liquidity-withdrawn", market-id: market-id, provider: tx-sender, amount: amount })
+        (ok amount)))
