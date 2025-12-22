@@ -9,23 +9,30 @@ plan:
     - id: 0
       transactions:
         - contract-publish:
+            contract-name: market-liquidity-pool
+            expected-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
+            cost: 12110706
+            path: contracts/market-liquidity-pool.clar
+            anchor-block-only: true
+            clarity-version: 4
+        - contract-publish:
             contract-name: market-manager
             expected-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
-            cost: 2940470
+            cost: 12527715
             path: contracts/market-manager.clar
             anchor-block-only: true
             clarity-version: 4
         - contract-publish:
             contract-name: market-token
             expected-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
-            cost: 2905358
+            cost: 12104157
             path: contracts/market-token.clar
             anchor-block-only: true
             clarity-version: 4
         - contract-publish:
             contract-name: oracle-registry
             expected-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
-            cost: 2922128
+            cost: 12174022
             path: contracts/oracle-registry.clar
             anchor-block-only: true
             clarity-version: 4
