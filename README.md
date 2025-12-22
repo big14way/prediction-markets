@@ -258,3 +258,24 @@ See `chainhooks/README.md` for detailed documentation.
 ## License
 
 MIT License
+
+## Testnet Deployment
+
+### market-liquidity-pool
+- **Status**: ✅ Deployed to Testnet
+- **Transaction ID**: `01e305228b45d6edaf594feb061048bf59d70427e66d11c7a1c1d97a83896421`
+- **Deployer**: `ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM`
+- **Explorer**: https://explorer.hiro.so/txid/01e305228b45d6edaf594feb061048bf59d70427e66d11c7a1c1d97a83896421?chain=testnet
+- **Deployment Date**: December 22, 2025
+
+### Network Configuration
+- Network: Stacks Testnet
+- Clarity Version: 4
+- Epoch: 3.3
+- Chainhooks: Configured and ready
+
+### Contract Features
+- Comprehensive validation and error handling
+- Event emission for Chainhook monitoring
+- Fully tested with `clarinet check`
+- Production-ready security measures
