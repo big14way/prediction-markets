@@ -21,11 +21,6 @@ path = "contracts/market-token.clar"
 clarity_version = 4
 epoch = 3.3
 
-[contracts.market-liquidity-pool]
-path = "contracts/market-liquidity-pool.clar"
-clarity_version = 4
-epoch = 3.3
-
 [repl.analysis]
 passes = ["check_checker"]
 
